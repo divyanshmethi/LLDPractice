@@ -1,3 +1,5 @@
+package singleFlightWithWaitGroup
+
 import (
 	"context"
 	"fmt"
@@ -15,19 +17,36 @@ type Call struct {
 	result Result
 }
 
+type CacheItem struct {
+	value  string
+	expiry time.Time
+}
+
 type SingleFlight struct {
 	mu    sync.Mutex
 	calls map[string]*Call
+	cache map[string]CacheItem
+	ttl   time.Duration
 }
 
-func NewSingleFlight() *SingleFlight {
+func NewSingleFlight(ttl time.Duration) *SingleFlight {
 	return &SingleFlight{
 		calls: make(map[string]*Call),
+		cache: make(map[string]CacheItem),
+		ttl:   ttl,
 	}
 }
 
 func (s *SingleFlight) Do(ctx context.Context, key string, fn func(ctx context.Context) (string, error)) (string, error) {
 	s.mu.Lock()
+	if cacheItem, exists := s.cache[key]; exists {
+		if time.Now().After(cacheItem.expiry) {
+			delete(s.cache, key)
+		} else {
+			s.mu.Unlock()
+			return cacheItem.value, nil
+		}
+	}
 	if call, exists := s.calls[key]; exists {
 		s.mu.Unlock()
 		call.wg.Wait() //Does not support context -- downside
@@ -39,6 +58,12 @@ func (s *SingleFlight) Do(ctx context.Context, key string, fn func(ctx context.C
 	s.mu.Unlock()
 	defer s.finishCall(key, call)
 	call.result.val, call.result.err = fn(ctx)
+	//populate cache
+	if call.result.err != nil {
+		s.mu.Lock()
+		s.cache[key] = CacheItem{value: call.result.val, expiry: time.Now().Add(s.ttl)}
+		s.mu.Unlock()
+	}
 	return call.result.val, call.result.err
 }
 
@@ -64,7 +89,7 @@ func expensiveFunction(ctx context.Context) (string, error) {
 
 func Master() {
 	var wg sync.WaitGroup
-	newFlight := NewSingleFlight()
+	newFlight := NewSingleFlight(time.Second * 10)
 	ctx, cancelFunc := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelFunc()
 	for i := 0; i < 10; i++ {
@@ -80,4 +105,10 @@ func Master() {
 		}(i)
 	}
 	wg.Wait()
+	res, err := newFlight.Do(ctx, "user123", expensiveFunction)
+	if err != nil {
+		fmt.Printf("error with cache hit, err: %v\n", err.Error())
+		return
+	}
+	fmt.Printf("cache hit result: %s\n", res)
 }
