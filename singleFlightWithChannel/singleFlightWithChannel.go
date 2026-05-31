@@ -27,7 +27,7 @@ func NewDeduplicator() *Deduplicator {
 	}
 }
 
-func (d *Deduplicator) Do(ctx context.Context, key string, fn func() (string, error)) (string, error) {
+func (d *Deduplicator) Do(ctx context.Context, key string, fn func(ctx context.Context) (string, error)) (string, error) {
 	d.mu.Lock()
 	if call, exists := d.calls[key]; exists {
 		d.mu.Unlock()
@@ -41,19 +41,30 @@ func (d *Deduplicator) Do(ctx context.Context, key string, fn func() (string, er
 	call := &Call{channel: make(chan struct{})}
 	d.calls[key] = call
 	d.mu.Unlock()
-	res, err := fn()
+	defer d.finishCall(key, call)
+	res, err := fn(ctx)
 	call.result = Result{res: res, err: err}
+	return res, err
+}
+
+func (d *Deduplicator) finishCall(key string, call *Call) {
+	if r := recover(); r != nil {
+		call.result.err = fmt.Errorf("panic: %v", r)
+	}
 	close(call.channel)
 	d.mu.Lock()
 	delete(d.calls, key)
 	d.mu.Unlock()
-	return res, err
 }
 
-func expensiveOperation() (string, error) {
-	time.Sleep(2 * time.Second)
-	// Simulate an expensive operation
-	return "expensive result", nil
+func expensiveOperation(ctx context.Context) (string, error) {
+	fmt.Println("Executing expensive operation...")
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-time.After(time.Second * 2):
+		return "user-profile-data", nil
+	}
 }
 
 func Master() {
