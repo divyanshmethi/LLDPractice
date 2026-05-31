@@ -23,10 +23,11 @@ type CacheItem struct {
 }
 
 type Deduplicator struct {
-	mu    sync.Mutex
-	calls map[string]*Call
-	ttl   time.Duration
-	cache map[string]CacheItem
+	mu      sync.Mutex
+	cachemu sync.RWMutex
+	calls   map[string]*Call
+	ttl     time.Duration
+	cache   map[string]CacheItem
 }
 
 func NewDeduplicator(ttl time.Duration) *Deduplicator {
@@ -38,26 +39,31 @@ func NewDeduplicator(ttl time.Duration) *Deduplicator {
 }
 
 func (d *Deduplicator) Do(ctx context.Context, key string, fn func(ctx context.Context) (string, error)) (string, error) {
-	d.mu.Lock()
+	d.cachemu.RLock()
 	//1. Check in cache first
 	if cacheItem, exists := d.cache[key]; exists {
+		d.cachemu.RUnlock()
 		if time.Now().After(cacheItem.expiration) {
+			d.cachemu.Lock()
 			delete(d.cache, key)
+			d.cachemu.Unlock()
 		} else {
-			d.mu.Unlock()
 			return cacheItem.value, nil
 		}
+	} else {
+		d.cachemu.RUnlock()
 	}
 	// -----------------------------
 	// INFLIGHT REQUEST EXISTS
 	// -----------------------------
+	d.mu.Lock()
 	if call, exists := d.calls[key]; exists {
 		d.mu.Unlock()
 		select {
 		case <-call.channel:
 			return call.result.res, call.result.err
 		case <-ctx.Done():
-			return call.result.res, ctx.Err()
+			return "", ctx.Err()
 		}
 	}
 	// -----------------------------
@@ -79,9 +85,9 @@ func (d *Deduplicator) Do(ctx context.Context, key string, fn func(ctx context.C
 	// POPULATE CACHE
 	// -------------------------------------------------
 	if err == nil {
-		d.mu.Lock()
+		d.cachemu.Lock()
 		d.cache[key] = CacheItem{value: res, expiration: time.Now().Add(d.ttl)}
-		d.mu.Unlock()
+		d.cachemu.Unlock()
 	}
 	return res, err
 }
