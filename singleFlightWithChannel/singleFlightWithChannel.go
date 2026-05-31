@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+const numShards = 64
+
 type Result struct {
 	res string
 	err error
@@ -22,43 +24,79 @@ type CacheItem struct {
 	expiration time.Time
 }
 
-type Deduplicator struct {
+type Shard struct {
 	mu      sync.Mutex
-	cachemu sync.RWMutex
 	calls   map[string]*Call
-	ttl     time.Duration
 	cache   map[string]CacheItem
+	cachemu sync.RWMutex
 }
 
-func NewDeduplicator(ttl time.Duration) *Deduplicator {
-	return &Deduplicator{
+type Deduplicator struct {
+	shards []Shard
+	ttl    time.Duration
+}
+
+func NewShard() Shard {
+	return Shard{
 		calls: make(map[string]*Call),
-		ttl:   ttl,
 		cache: make(map[string]CacheItem),
 	}
 }
 
+func NewDeduplicator(ttl time.Duration) *Deduplicator {
+	shards := make([]Shard, numShards)
+
+	for i := range shards {
+		shards[i] = NewShard()
+	}
+
+	return &Deduplicator{
+		shards: shards,
+		ttl:    ttl,
+	}
+}
+
+func hash(key string) uint32 {
+	var h uint32 = 2166136261
+
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= 16777619
+	}
+
+	return h
+}
+
+func (d *Deduplicator) getShard(key string) *Shard {
+	idx := hash(key) % numShards
+	return &d.shards[idx]
+}
+
 func (d *Deduplicator) Do(ctx context.Context, key string, fn func(ctx context.Context) (string, error)) (string, error) {
-	d.cachemu.RLock()
+	s := d.getShard(key)
+	now := time.Now()
+	s.cachemu.RLock()
 	//1. Check in cache first
-	if cacheItem, exists := d.cache[key]; exists {
-		d.cachemu.RUnlock()
-		if time.Now().After(cacheItem.expiration) {
-			d.cachemu.Lock()
-			delete(d.cache, key)
-			d.cachemu.Unlock()
-		} else {
-			return cacheItem.value, nil
+	cacheItem, exists := s.cache[key]
+	if exists && now.Before(cacheItem.expiration) {
+		s.cachemu.RUnlock()
+		return cacheItem.value, nil
+	}
+	s.cachemu.RUnlock()
+	if exists {
+		s.cachemu.Lock()
+		cacheItem, exists = s.cache[key]
+		if exists && now.After(cacheItem.expiration) {
+			delete(s.cache, key)
 		}
-	} else {
-		d.cachemu.RUnlock()
+		s.cachemu.Unlock()
 	}
 	// -----------------------------
 	// INFLIGHT REQUEST EXISTS
 	// -----------------------------
-	d.mu.Lock()
-	if call, exists := d.calls[key]; exists {
-		d.mu.Unlock()
+	s.mu.Lock()
+	if call, exists := s.calls[key]; exists {
+		s.mu.Unlock()
 		select {
 		case <-call.channel:
 			return call.result.res, call.result.err
@@ -70,12 +108,12 @@ func (d *Deduplicator) Do(ctx context.Context, key string, fn func(ctx context.C
 	// FIRST GOROUTINE
 	// -----------------------------
 	call := &Call{channel: make(chan struct{})}
-	d.calls[key] = call
-	d.mu.Unlock()
+	s.calls[key] = call
+	s.mu.Unlock()
 	// -------------------------------------------------
 	// GUARANTEED CLEANUP + RECOVERY
 	// -------------------------------------------------
-	defer d.finishCall(key, call)
+	defer s.finishCall(key, call)
 	// -------------------------------------------------
 	// EXECUTE EXPENSIVE FUNCTION
 	// -------------------------------------------------
@@ -85,14 +123,14 @@ func (d *Deduplicator) Do(ctx context.Context, key string, fn func(ctx context.C
 	// POPULATE CACHE
 	// -------------------------------------------------
 	if err == nil {
-		d.cachemu.Lock()
-		d.cache[key] = CacheItem{value: res, expiration: time.Now().Add(d.ttl)}
-		d.cachemu.Unlock()
+		s.cachemu.Lock()
+		s.cache[key] = CacheItem{value: res, expiration: time.Now().Add(d.ttl)}
+		s.cachemu.Unlock()
 	}
 	return res, err
 }
 
-func (d *Deduplicator) finishCall(key string, call *Call) {
+func (s *Shard) finishCall(key string, call *Call) {
 	// Panic recovery
 	if r := recover(); r != nil {
 		call.result.err = fmt.Errorf("panic: %v", r)
@@ -100,9 +138,9 @@ func (d *Deduplicator) finishCall(key string, call *Call) {
 	// Wake all waiters
 	close(call.channel)
 	// Cleanup inflight map
-	d.mu.Lock()
-	delete(d.calls, key)
-	d.mu.Unlock()
+	s.mu.Lock()
+	delete(s.calls, key)
+	s.mu.Unlock()
 }
 
 func expensiveOperation(ctx context.Context) (string, error) {
