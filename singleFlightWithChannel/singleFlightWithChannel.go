@@ -1,6 +1,7 @@
 package singleFlightWithChannel
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -26,12 +27,16 @@ func NewDeduplicator() *Deduplicator {
 	}
 }
 
-func (d *Deduplicator) Do(key string, fn func() (string, error)) (string, error) {
+func (d *Deduplicator) Do(ctx context.Context, key string, fn func() (string, error)) (string, error) {
 	d.mu.Lock()
 	if call, exists := d.calls[key]; exists {
 		d.mu.Unlock()
-		<-call.channel
-		return call.result.res, call.result.err
+		select {
+		case <-call.channel:
+			return call.result.res, call.result.err
+		case <-ctx.Done():
+			return call.result.res, ctx.Err()
+		}
 	}
 	call := &Call{channel: make(chan struct{})}
 	d.calls[key] = call
@@ -53,12 +58,14 @@ func expensiveOperation() (string, error) {
 
 func Master() {
 	deduplicator := NewDeduplicator()
+	ctx, cancelFunc := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelFunc()
 	var wg sync.WaitGroup
 	for i := 1; i < 11; i++ {
 		wg.Add(1)
 		go func(routineIndex int) {
 			defer wg.Done()
-			val, err := deduplicator.Do("user123", expensiveOperation)
+			val, err := deduplicator.Do(ctx, "user123", expensiveOperation)
 			if err != nil {
 				fmt.Printf("Goroutine %d got error: %v", routineIndex, err.Error())
 			}
