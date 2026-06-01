@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+const numShards = 64
+
 type Result struct {
 	val string
 	err error
@@ -22,52 +24,88 @@ type CacheItem struct {
 	expiry time.Time
 }
 
+type Shard struct {
+	mu      sync.Mutex
+	cacheMu sync.RWMutex
+	calls   map[string]*Call
+	cache   map[string]CacheItem
+}
+
 type SingleFlight struct {
-	mu    sync.Mutex
-	calls map[string]*Call
-	cache map[string]CacheItem
-	ttl   time.Duration
+	shards []Shard
+	ttl    time.Duration
 }
 
 func NewSingleFlight(ttl time.Duration) *SingleFlight {
+	shards := make([]Shard, numShards)
+	for i := 0; i < numShards; i++ {
+		shards[i] = Shard{
+			calls: make(map[string]*Call),
+			cache: make(map[string]CacheItem),
+		}
+	}
 	return &SingleFlight{
-		calls: make(map[string]*Call),
-		cache: make(map[string]CacheItem),
-		ttl:   ttl,
+		shards: shards,
+		ttl:    ttl,
 	}
 }
 
-func (s *SingleFlight) Do(ctx context.Context, key string, fn func(ctx context.Context) (string, error)) (string, error) {
-	s.mu.Lock()
-	if cacheItem, exists := s.cache[key]; exists {
-		if time.Now().After(cacheItem.expiry) {
-			delete(s.cache, key)
-		} else {
-			s.mu.Unlock()
-			return cacheItem.value, nil
-		}
+func hash(key string) uint32 {
+	var h uint32 = 2166136261
+
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= 16777619
 	}
-	if call, exists := s.calls[key]; exists {
-		s.mu.Unlock()
+
+	return h
+}
+
+func (s *SingleFlight) getShard(key string) *Shard {
+	return &s.shards[hash(key)%numShards]
+}
+
+func (s *SingleFlight) Do(ctx context.Context, key string, fn func(ctx context.Context) (string, error)) (string, error) {
+	shard := s.getShard(key)
+	now := time.Now()
+	shard.cacheMu.RLock()
+	cacheItem, exists := shard.cache[key]
+	if exists && now.Before(cacheItem.expiry) {
+		shard.cacheMu.RUnlock()
+		return cacheItem.value, nil
+	}
+	shard.cacheMu.RUnlock()
+	if exists {
+		shard.cacheMu.Lock()
+		if cacheItem, exists = shard.cache[key]; exists {
+			if now.After(cacheItem.expiry) {
+				delete(shard.cache, key)
+			}
+		}
+		shard.cacheMu.Unlock()
+	}
+	shard.mu.Lock()
+	if call, exists := shard.calls[key]; exists {
+		shard.mu.Unlock()
 		call.wg.Wait() //Does not support context -- downside
 		return call.result.val, call.result.err
 	}
 	call := &Call{wg: sync.WaitGroup{}}
 	call.wg.Add(1)
-	s.calls[key] = call
-	s.mu.Unlock()
-	defer s.finishCall(key, call)
+	shard.calls[key] = call
+	shard.mu.Unlock()
+	defer shard.finishCall(key, call)
 	call.result.val, call.result.err = fn(ctx)
 	//populate cache
-	if call.result.err != nil {
-		s.mu.Lock()
-		s.cache[key] = CacheItem{value: call.result.val, expiry: time.Now().Add(s.ttl)}
-		s.mu.Unlock()
+	if call.result.err == nil {
+		shard.cacheMu.Lock()
+		shard.cache[key] = CacheItem{value: call.result.val, expiry: time.Now().Add(s.ttl)}
+		shard.cacheMu.Unlock()
 	}
 	return call.result.val, call.result.err
 }
 
-func (s *SingleFlight) finishCall(key string, call *Call) {
+func (s *Shard) finishCall(key string, call *Call) {
 	if r := recover(); r != nil {
 		call.result.err = fmt.Errorf("panic: %v", r)
 	}
