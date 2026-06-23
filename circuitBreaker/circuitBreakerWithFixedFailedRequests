@@ -1,0 +1,129 @@
+package circuitBreaker
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+)
+
+type State int
+
+const (
+	CLOSED State = iota
+	OPENED
+	HALFOPEN
+)
+
+var circuitOpenErr = errors.New("circuit is open")
+
+// 1. Possible state -- Open, Closed, Half Open
+// 2. Movement to Closed --> Open after N consecutive failure, N can be passed as param
+// 3. Movement from Closed to Half Open --> After timeout of t seconds which is configurable again
+// 4. Thread Safe
+type CircuitBreaker struct {
+	mu                sync.Mutex
+	failureCount      int64
+	failureThreshold  int64
+	ciruitOpenedAt    time.Time
+	circuitTimeout    int64
+	state             state
+	maxHalfOpenProbes int64
+	halfOpenProbes    int64
+}
+
+func NewCircuitBreaker(failureThreshold, circuitTimeout, maxHalfOpenProbes int64) *CircuitBreaker {
+	return &CircuitBreaker{
+		state:             CLOSED,
+		failureThreshold:  failureThreshold,
+		circuitTimeout:    circuitTimeout,
+		maxHalfOpenProbes: maxHalfOpenProbes,
+	}
+}
+
+func (c *CircuitBreaker) Execute(fn func(i int64) (string, error), count int64) (string, error) {
+	if !c.isAllowed() {
+		return "", circuitOpenErr
+	}
+	resp, err := fn(count)
+	if err != nil {
+		c.handleError()
+		return "", err
+	}
+	c.handleSuccess()
+	return resp, nil
+}
+
+func (c *CircuitBreaker) isAllowed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch c.state {
+	case CLOSED:
+		return true
+	case OPENED:
+		if time.Since(c.ciruitOpenedAt) > time.Duration(c.circuitTimeout)*time.Second {
+			c.state = HALFOPEN
+			return true
+		}
+		return false
+	case HALFOPEN:
+		if c.halfOpenProbes >= c.maxHalfOpenProbes {
+			return false
+		}
+		c.halfOpenProbes++
+		return true
+	default:
+		panic("unhandled default case")
+	}
+}
+
+func (c *CircuitBreaker) handleError() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch c.state {
+	case CLOSED:
+		c.failureCount++
+		if c.failureCount >= c.failureThreshold {
+			c.tripOpen()
+		}
+	case HALFOPEN:
+		c.tripOpen()
+	default:
+		panic("unhandled default case")
+	}
+}
+
+func (c *CircuitBreaker) tripOpen() {
+	c.state = OPENED
+	c.ciruitOpenedAt = time.Now()
+}
+
+func (c *CircuitBreaker) handleSuccess() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch c.state {
+	case HALFOPEN:
+		c.state = CLOSED
+		c.failureCount = 0
+	case CLOSED:
+		c.failureCount = 0
+	default:
+		panic("unhandled default case")
+	}
+}
+
+func main() {
+	cb := NewCircuitBreaker(5, 1, 1)
+	for i := 1; i < 111111; i++ {
+		resp, err := cb.Execute(func(i int64) (string, error) {
+			time.Sleep(1 * time.Second)
+			// Simulate an error
+			if i < 6 {
+				return "", errors.New("simulated error")
+			}
+			return fmt.Sprintf("success with count %d", i), nil
+		}, int64(i))
+		fmt.Println(err)
+		fmt.Println(resp)
+	}
+}
