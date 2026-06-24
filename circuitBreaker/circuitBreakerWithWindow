@@ -1,0 +1,192 @@
+package circuitBreaker
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+)
+
+type state int
+
+const (
+	CLOSED state = iota
+	OPENED
+	HALFOPEN
+)
+
+var circuitOpenErr = errors.New("circuit is open")
+
+// 1. Possible state -- Open, Closed, Half Open
+// 2. Movement to Closed --> Open after N consecutive failure, N can be passed as param
+// 3. Movement from Closed to Half Open --> After timeout of t seconds which is configurable again
+// 4. Thread Safe
+type CircuitBreaker struct {
+	mu                sync.Mutex
+	failureThreshold  float64
+	circuitOpenedAt   time.Time
+	openTimeout       time.Duration
+	state             state
+	maxHalfOpenProbes int64
+	halfOpenProbes    int64
+	slidingWindow     *SlidingWindow
+	minimumRequests   int64
+}
+
+func (c *CircuitBreaker) State() state {
+	return c.state
+}
+
+type Result bool
+
+const (
+	Success Result = true
+	Failure Result = false
+)
+
+type SlidingWindow struct {
+	size          int64
+	totalRequests int64
+	mu            sync.Mutex
+	failureCount  int64
+	results       []Result
+	current       int64
+}
+
+func NewSlidingWindow(size int64) *SlidingWindow {
+	return &SlidingWindow{
+		size:          size,
+		current:       0,
+		totalRequests: 0,
+		failureCount:  0,
+		results:       make([]Result, size),
+	}
+}
+
+func (s *SlidingWindow) handle(result Result) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.totalRequests >= s.size {
+		c := s.results[s.current]
+		if c == Failure {
+			s.failureCount--
+		}
+	} else {
+		s.totalRequests++
+	}
+	if result == Failure {
+		s.failureCount++
+	}
+	s.results[s.current] = result
+	s.current = (s.current + 1) % s.size
+}
+
+func (s *SlidingWindow) errorPercentage() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.totalRequests == 0 {
+		return 0
+	}
+	return float64(s.failureCount) / float64(s.totalRequests) * 100
+}
+
+func NewCircuitBreaker(failureThreshold float64, circuitTimeout time.Duration, maxHalfOpenProbes, size, minimumRequests int64) *CircuitBreaker {
+	return &CircuitBreaker{
+		state:             CLOSED,
+		failureThreshold:  failureThreshold,
+		openTimeout:       circuitTimeout,
+		maxHalfOpenProbes: maxHalfOpenProbes,
+		slidingWindow:     NewSlidingWindow(size),
+		minimumRequests:   minimumRequests,
+	}
+}
+
+func (c *CircuitBreaker) Execute(fn func(i int64) (string, error), count int64) (string, error) {
+	if !c.isAllowed() {
+		return "", circuitOpenErr
+	}
+	resp, err := fn(count)
+	if err != nil {
+		c.handleError()
+		return "", err
+	}
+	c.handleSuccess()
+	return resp, nil
+}
+
+func (c *CircuitBreaker) isAllowed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch c.state {
+	case CLOSED:
+		return true
+	case OPENED:
+		if time.Since(c.circuitOpenedAt) > c.openTimeout {
+			c.state = HALFOPEN
+			c.halfOpenProbes = 1
+			return true
+		}
+		return false
+	case HALFOPEN:
+		if c.halfOpenProbes >= c.maxHalfOpenProbes {
+			return false
+		}
+		c.halfOpenProbes++
+		return true
+	default:
+		panic("unhandled default case")
+	}
+}
+
+func (c *CircuitBreaker) handleError() {
+	c.slidingWindow.handle(Failure)
+	errorRate := c.slidingWindow.errorPercentage()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch c.state {
+	case CLOSED:
+		if c.slidingWindow.totalRequests > c.minimumRequests && errorRate >= c.failureThreshold {
+			c.tripOpen()
+		}
+	case HALFOPEN:
+		c.tripOpen()
+	default:
+		panic("unhandled default case")
+	}
+}
+
+func (c *CircuitBreaker) tripOpen() {
+	c.state = OPENED
+	c.circuitOpenedAt = time.Now()
+	c.halfOpenProbes = 0
+}
+
+func (c *CircuitBreaker) handleSuccess() {
+	c.slidingWindow.handle(Success)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch c.state {
+	case HALFOPEN:
+		c.state = CLOSED
+		c.halfOpenProbes = 0
+	case CLOSED:
+	default:
+		panic("unhandled default case")
+	}
+}
+
+func main() {
+	cb := NewCircuitBreaker(49, 1*time.Second, 1, 100, 20)
+	for i := 1; i < 111; i++ {
+		resp, err := cb.Execute(func(i int64) (string, error) {
+			time.Sleep(1 * time.Second)
+			// Simulate an error
+			if i%2 == 0 {
+				return "", errors.New("simulated error")
+			}
+			return fmt.Sprintf("success with count %d", i), nil
+		}, int64(i))
+		fmt.Println(err)
+		fmt.Println(resp)
+	}
+}
